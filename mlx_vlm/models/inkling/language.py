@@ -460,11 +460,11 @@ _attn_kernel = mx.fast.metal_kernel(
     ensure_row_contiguous=False,
 )
 
-# Escape hatch: force the unfused decode-attention path (debugging/AB tests).
-_FUSED_ATTN_DECODE = True
-# Below this key length the unfused mask+SDPA path is slightly faster (fewer,
-# larger kernels beat the custom kernel at tiny S); above it the fused kernel
-# wins outright and by 4k context is ~2.6x faster end-to-end.
+# The fused decode-attention kernel predates the sliding K/V slice; with the
+# slice bounding 35/42 layers at their window, mask+SDPA beats it at every
+# context length measured (short AND 4k), so it is off by default and kept as
+# a reference / escape hatch for cache layouts the slice cannot serve.
+_FUSED_ATTN_DECODE = False
 _FUSED_ATTN_MIN_S = 512
 # Escape hatch: skip the sliding-layer out-of-window K/V slicing.
 _SLIDING_KV_SLICE = True
