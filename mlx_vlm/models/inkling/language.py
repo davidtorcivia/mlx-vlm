@@ -1,3 +1,4 @@
+from functools import partial
 from typing import Optional
 
 import mlx.core as mx
@@ -350,12 +351,21 @@ class InklingSwitchGLU(SwitchGLU):
         super().__init__(input_dims, hidden_dims, num_experts, **kwargs)
         self.gate_scale = mx.ones((num_experts,))  # s13 (fused gate/up scale2)
         self.out_scale = mx.ones((num_experts,))  # s13 * s2
+        self._scales_trivial = None
 
     def _per_expert(self, scale, idx, like):
         s = scale[idx].astype(like.dtype)
         return s.reshape(s.shape + (1,) * (like.ndim - s.ndim))
 
     def __call__(self, x, indices) -> mx.array:
+        # Non-NVFP4 checkpoints carry all-ones expert scales; skip the two
+        # gather+mul chains entirely then (checked once, after load).
+        if self._scales_trivial is None:
+            self._scales_trivial = bool(
+                (mx.all(self.gate_scale == 1) & mx.all(self.out_scale == 1)).item()
+            )
+        if self._scales_trivial:
+            return super().__call__(x, indices)
         x = mx.expand_dims(x, (-2, -3))
         do_sort = indices.size >= 64
         idx = indices
@@ -372,6 +382,114 @@ class InklingSwitchGLU(SwitchGLU):
         return x.squeeze(-2)
 
 
+_ROUTE_SRC = r"""
+    // One simdgroup (32 lanes) per token; each lane owns ceil(R/32) experts
+    // (strided by 32 so logit reads coalesce). Top-K via K rounds of
+    // simd_max; ties resolved to the lowest lane (deterministic).
+    uint lane = thread_position_in_grid.x;   // 0..31, simd lane
+    uint n = thread_position_in_grid.y;      // token
+    if (n >= N) return;
+    const device T* lg = logits + (size_t)n * (R + SH);
+    float ws = wscale[0];
+    constexpr int PER = (R + 31) / 32;
+    float sc[PER];
+    float tl_[PER];
+    bool taken[PER];
+    for (int t = 0; t < PER; ++t) {
+        uint j = lane + (uint)t * 32u;
+        taken[t] = false;
+        if (j < R) {
+            float l = (float)lg[j];
+            tl_[t] = l;
+            sc[t] = 1.0f / (1.0f + metal::exp(-l)) + (float)corr[j];
+        } else {
+            sc[t] = -INFINITY;
+        }
+    }
+    uint bidx[K];
+    float btl[K];
+    for (uint kk = 0; kk < K; ++kk) {
+        float lb = -INFINITY; int lt = -1;
+        for (int t = 0; t < PER; ++t)
+            if (!taken[t] && sc[t] > lb) { lb = sc[t]; lt = t; }
+        float gb = simd_max(lb);
+        ushort wl = (ushort)simd_min(lb == gb ? lane : 32u);
+        uint wj = simd_shuffle(lt >= 0 ? lane + (uint)lt * 32u : 0u, wl);
+        float wtl = simd_shuffle(lt >= 0 ? tl_[lt] : 0.0f, wl);
+        if (lane == (uint)wl && lt >= 0 && sc[lt] == gb) taken[lt] = true;
+        bidx[kk] = wj; btl[kk] = wtl;
+    }
+    // Routing weights: softmax over logsigmoid of the K routed + SH shared
+    // logits, times route_scale * global_scale (folded into ws). Computed
+    // redundantly on every lane (cheap; K + SH values).
+    float lp[K + SH];
+    float m = -INFINITY;
+    for (uint t = 0; t < K + SH; ++t) {
+        float tv = (t < K) ? btl[t] : (float)lg[R + (t - K)];
+        float a = -tv;
+        float lad = metal::max(a, 0.0f)
+                  + metal::log(1.0f + metal::exp(-metal::fabs(a)));
+        lp[t] = -lad;
+        m = metal::max(m, lp[t]);
+    }
+    float se = 0.0f;
+    for (uint t = 0; t < K + SH; ++t) se += metal::exp(lp[t] - m);
+    float lse = m + metal::log(se);
+    if (lane < K) {
+        idx[(size_t)n * K + lane] = bidx[lane];
+        wk[(size_t)n * K + lane] = (T)(metal::exp(lp[lane] - lse) * ws);
+    }
+    T gv[SH];
+    for (uint s = 0; s < SH; ++s) gv[s] = (T)(metal::exp(lp[K + s] - lse) * ws);
+    device T* gp = gamma + (size_t)n * SH * I;
+    for (uint t = lane; t < SH * I; t += 32u) gp[t] = gv[t / I];
+"""
+_route_kernel = mx.fast.metal_kernel(
+    name="inkling_moe_route",
+    input_names=["logits", "corr", "wscale"],
+    output_names=["idx", "wk", "gamma"],
+    source=_ROUTE_SRC,
+)
+
+
+@partial(mx.compile, shapeless=True)
+def _swiglu_scaled(gate, up, s):
+    return nn.silu(gate) * up * s
+
+
+class InklingSharedExpertsDense(nn.Module):
+    """The ``n_shared`` always-on experts as one dense SwiGLU: expert weights are
+    concatenated at load (see ``shared_experts_to_dense``) so the fixed-index
+    gather_qmm path becomes three plain matmuls. Per-token expert weights arrive
+    pre-broadcast over the expert-major intermediate (``gamma``) and are applied
+    before down_proj, which distributes over the concatenated experts exactly."""
+
+    def __init__(self, input_dims: int, hidden_dims: int, num_experts: int):
+        super().__init__()
+        self.gate_proj = nn.Linear(input_dims, num_experts * hidden_dims, bias=False)
+        self.up_proj = nn.Linear(input_dims, num_experts * hidden_dims, bias=False)
+        self.down_proj = nn.Linear(num_experts * hidden_dims, input_dims, bias=False)
+
+    def __call__(self, x, gamma):
+        return self.down_proj(_swiglu_scaled(self.gate_proj(x), self.up_proj(x), gamma))
+
+
+def shared_experts_to_dense(weights):
+    """Remap SwitchGLU-shaped shared-expert tensors ``[E, out, in]`` (bf16 or
+    quantized triplets) to the dense concatenated layout of
+    ``InklingSharedExpertsDense``. Expert-major on the intermediate axis, so
+    gate/up stack experts along rows and down stacks along input columns."""
+    out = {}
+    for k, v in weights.items():
+        if ".shared_experts." in k and isinstance(v, mx.array) and v.ndim == 3:
+            if ".down_proj." in k:
+                v = v.transpose(1, 0, 2).reshape(v.shape[1], -1)
+            else:
+                v = v.reshape(-1, v.shape[2])
+        out[k] = v
+    return out
+
+
 class InklingSparseMoE(nn.Module):
     """Sigmoid-gated fine-grained MoE: top-k routed experts (+ correction-bias selection)
     plus always-on shared experts, weighted by a logsigmoid/logsumexp softmax."""
@@ -382,24 +500,51 @@ class InklingSparseMoE(nn.Module):
         self.n_shared = config.n_shared_experts
         self.top_k = config.num_experts_per_tok
         self.route_scale = config.route_scale
+        self.intermediate_size = config.intermediate_size
         self.gate_weight = mx.zeros((self.n_routed + self.n_shared, config.hidden_size))
         self.e_score_correction_bias = mx.zeros((self.n_routed,))
         self.global_scale = mx.ones((1,))
         self.switch_mlp = InklingSwitchGLU(
             config.hidden_size, config.intermediate_size, self.n_routed
         )
-        self.shared_experts = SwitchGLU(
+        self.shared_experts = InklingSharedExpertsDense(
             config.hidden_size, config.intermediate_size, self.n_shared
         )
+        self._wscale = None
 
-    def __call__(self, x):
-        B, L, D = x.shape
-        xf = x.reshape(-1, D)
-        logits = xf @ self.gate_weight.astype(x.dtype).T
+    def _route(self, logits):
+        """Expert selection + routing weights. On GPU the whole post-matmul
+        chain (sigmoid + bias + top-k + logsigmoid softmax + scaling) is one
+        kernel; it also emits the shared-expert weights pre-broadcast over the
+        expert-major dense intermediate."""
+        N = logits.shape[0]
+        if self._wscale is None:
+            self._wscale = mx.array(
+                [self.route_scale], dtype=mx.float32
+            ) * self.global_scale.astype(mx.float32)
+        if mx.default_device() == mx.gpu:
+            return _route_kernel(
+                inputs=[logits, self.e_score_correction_bias, self._wscale],
+                template=[
+                    ("T", logits.dtype),
+                    ("N", N),
+                    ("R", self.n_routed),
+                    ("SH", self.n_shared),
+                    ("K", self.top_k),
+                    ("I", self.intermediate_size),
+                ],
+                grid=(32, N, 1),
+                threadgroup=(32, 1, 1),
+                output_shapes=[
+                    (N, self.top_k),
+                    (N, self.top_k),
+                    (N, self.n_shared * self.intermediate_size),
+                ],
+                output_dtypes=[mx.uint32, logits.dtype, logits.dtype],
+            )
         scores = mx.sigmoid(logits.astype(mx.float32))
         sfc = scores[:, : self.n_routed] + self.e_score_correction_bias
         idx = mx.argpartition(-sfc, self.top_k - 1, axis=-1)[:, : self.top_k]
-
         routed_logits = logits[:, : self.n_routed]
         shared_logits = logits[:, -self.n_shared :]
         tl = mx.concatenate(
@@ -411,16 +556,24 @@ class InklingSparseMoE(nn.Module):
             * self.route_scale
             * self.global_scale
         )
-        shared_gammas = w[:, -self.n_shared :]
-        topk_w = w[:, : self.top_k]
-
-        yr = (self.switch_mlp(xf, idx) * topk_w[..., None].astype(x.dtype)).sum(axis=-2)
-        sh_idx = mx.broadcast_to(
-            mx.arange(self.n_shared)[None], (xf.shape[0], self.n_shared)
+        topk_w = w[:, : self.top_k].astype(logits.dtype)
+        gamma = mx.repeat(
+            w[:, -self.n_shared :].astype(logits.dtype),
+            self.intermediate_size,
+            axis=-1,
         )
-        ys = (
-            self.shared_experts(xf, sh_idx) * shared_gammas[..., None].astype(x.dtype)
-        ).sum(axis=-2)
+        return idx.astype(mx.uint32), topk_w, gamma
+
+    def __call__(self, x):
+        B, L, D = x.shape
+        xf = x.reshape(-1, D)
+        gw = self.gate_weight
+        if gw.dtype != x.dtype:
+            gw = gw.astype(x.dtype)
+        logits = xf @ gw.T
+        idx, topk_w, gamma = self._route(logits)
+        yr = (self.switch_mlp(xf, idx) * topk_w[..., None]).sum(axis=-2)
+        ys = self.shared_experts(xf, gamma)
         return (yr + ys).reshape(B, L, D).astype(x.dtype)
 
 
