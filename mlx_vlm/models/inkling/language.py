@@ -468,6 +468,8 @@ _FUSED_ATTN_DECODE = True
 _FUSED_ATTN_MIN_S = 512
 # Escape hatch: skip the sliding-layer out-of-window K/V slicing.
 _SLIDING_KV_SLICE = True
+# Escape hatch: use gather_qmm for the routed down projection at decode.
+_DOWN_COMBINE = True
 
 
 class InklingAttention(nn.Module):
@@ -658,14 +660,18 @@ class InklingSwitchGLU(SwitchGLU):
         s = scale[idx].astype(like.dtype)
         return s.reshape(s.shape + (1,) * (like.ndim - s.ndim))
 
-    def __call__(self, x, indices) -> mx.array:
-        # Non-NVFP4 checkpoints carry all-ones expert scales; skip the two
-        # gather+mul chains entirely then (checked once, after load).
+    def scales_trivial(self):
+        # Non-NVFP4 checkpoints carry all-ones expert scales; checked once,
+        # after load.
         if self._scales_trivial is None:
             self._scales_trivial = bool(
                 (mx.all(self.gate_scale == 1) & mx.all(self.out_scale == 1)).item()
             )
-        if self._scales_trivial:
+        return self._scales_trivial
+
+    def __call__(self, x, indices) -> mx.array:
+        # All-ones expert scales: skip the two gather+mul chains entirely.
+        if self.scales_trivial():
             return super().__call__(x, indices)
         x = mx.expand_dims(x, (-2, -3))
         do_sort = indices.size >= 64
@@ -750,6 +756,62 @@ _route_kernel = mx.fast.metal_kernel(
     input_names=["logits", "corr", "wscale"],
     output_names=["idx", "wk", "gamma"],
     source=_ROUTE_SRC,
+)
+
+
+_DOWN_COMBINE_SRC = r"""
+    // Weighted routed-expert down-projection for decode: gather_qmm's
+    // vector-per-expert mode runs at ~200 GB/s on the [2048 -> 4096] down
+    // shape (vs ~750 broadcast), so this kernel dequantizes q4/g64 rows
+    // directly: one threadgroup per output row, one simdgroup per selected
+    // expert, one quant group per lane; the top-k weighted sum over experts
+    // is folded in, so the [N, K, out] intermediate never exists.
+    uint lane = thread_index_in_simdgroup;
+    uint sg   = simdgroup_index_in_threadgroup;   // expert slot (8 sgs, K used)
+    uint row  = threadgroup_position_in_grid.y;   // output row [0, OUT)
+    uint n    = threadgroup_position_in_grid.z;   // token
+    threadgroup float partial[8];
+    if (sg < K) {
+        uint e = idx[(size_t)n * K + sg];
+        const device uint* wr = wq + ((size_t)e * OUT + row) * (IN / 8u);
+        const device T* sr = sc + ((size_t)e * OUT + row) * GROUPS;
+        const device T* br = bi + ((size_t)e * OUT + row) * GROUPS;
+        const device T* xr = xin + ((size_t)n * K + sg) * IN;
+        float s = (float)sr[lane];
+        float b = (float)br[lane];
+        float accq = 0.0f, accx = 0.0f;
+        uint base = lane * 8u;      // 8 uint32 = 64 packed q4 values
+        uint xbase = lane * 64u;
+        for (uint u = 0; u < 8u; ++u) {
+            uint w8 = wr[base + u];
+            for (uint t = 0; t < 8u; ++t) {
+                float xv = (float)xr[xbase + u * 8u + t];
+                accq += (float)((w8 >> (4u * t)) & 0xFu) * xv;
+                accx += xv;
+            }
+        }
+        float dot = simd_sum(s * accq + b * accx);
+        if (lane == 0) {
+            // match the unfused chain: down output rounds to T, then the
+            // per-expert weight multiply rounds again before the sum
+            float dv = (float)((T)dot);
+            partial[sg] = (float)((T)(dv * (float)wk[(size_t)n * K + sg]));
+        }
+    } else if (lane == 0) {
+        partial[sg] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0 && lane == 0) {
+        float tot = 0.0f;
+        for (uint t = 0; t < 8u; ++t) tot += partial[t];
+        out[(size_t)n * OUT + row] = (T)tot;
+    }
+"""
+_down_combine_kernel = mx.fast.metal_kernel(
+    name="inkling_moe_down_combine",
+    input_names=["xin", "wq", "sc", "bi", "idx", "wk"],
+    output_names=["out"],
+    source=_DOWN_COMBINE_SRC,
 )
 
 
@@ -893,7 +955,41 @@ class InklingSparseMoE(nn.Module):
             gw = gw.astype(x.dtype)
         logits = xf @ gw.T
         idx, topk_w, gamma = self._route(logits)
-        yr = (self.switch_mlp(xf, idx) * topk_w[..., None]).sum(axis=-2)
+        sm = self.switch_mlp
+        dp = sm.down_proj
+        if (
+            _DOWN_COMBINE
+            and xf.shape[0] <= 8
+            and mx.default_device() == mx.gpu
+            and getattr(dp, "bits", None) == 4
+            and getattr(dp, "group_size", None) == 64
+            and getattr(dp, "mode", "affine") == "affine"
+            and getattr(dp, "biases", None) is not None
+            and dp.input_dims == 2048  # kernel maps one 64-wide group per lane
+            and dp.scales.dtype == x.dtype
+            and sm.scales_trivial()
+        ):
+            # decode: gather_qmm's vector-per-expert mode is ~3.5x off peak on
+            # the down shape; dequantize rows directly and fold the weighted
+            # expert sum in.
+            xe = mx.expand_dims(xf, (-2, -3))
+            act = sm.activation(sm.up_proj(xe, idx), sm.gate_proj(xe, idx))
+            yr = _down_combine_kernel(
+                inputs=[act, dp.weight, dp.scales, dp.biases, idx, topk_w],
+                template=[
+                    ("T", x.dtype),
+                    ("OUT", dp.output_dims),
+                    ("IN", dp.input_dims),
+                    ("GROUPS", dp.input_dims // 64),
+                    ("K", self.top_k),
+                ],
+                grid=(256, dp.output_dims, xf.shape[0]),
+                threadgroup=(256, 1, 1),
+                output_shapes=[(xf.shape[0], dp.output_dims)],
+                output_dtypes=[x.dtype],
+            )[0]
+        else:
+            yr = (sm(xf, idx) * topk_w[..., None]).sum(axis=-2)
         ys = self.shared_experts(xf, gamma)
         return (yr + ys).reshape(B, L, D).astype(x.dtype)
 
