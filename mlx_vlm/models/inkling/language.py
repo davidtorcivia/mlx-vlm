@@ -398,6 +398,10 @@ _attn_kernel = mx.fast.metal_kernel(
 
 # Escape hatch: force the unfused decode-attention path (debugging/AB tests).
 _FUSED_ATTN_DECODE = True
+# Below this key length the unfused mask+SDPA path is slightly faster (fewer,
+# larger kernels beat the custom kernel at tiny S); above it the fused kernel
+# wins outright and by 4k context is ~2.6x faster end-to-end.
+_FUSED_ATTN_MIN_S = 512
 
 
 class InklingAttention(nn.Module):
@@ -471,6 +475,10 @@ class InklingAttention(nn.Module):
         if (
             L == 1
             and _FUSED_ATTN_DECODE
+            and S >= _FUSED_ATTN_MIN_S
+            # the kernel's 128-thread threadgroup layout assumes head_dim 128
+            and self.head_dim == 128
+            and self.n_heads % self.n_kv == 0
             and mx.default_device() == mx.gpu
             # the kernel reads k/v/qkvr as one dtype; a promoted-fp32 cache
             # (e.g. fp32 norm weights) must take the unfused path
