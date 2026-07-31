@@ -102,11 +102,55 @@ _mask_kernel = mx.fast.metal_kernel(
 )
 
 
+_MASK_V2_SRC = r"""
+    // Shape-generic variant of the banded mask: every runtime dimension comes
+    // from injected shapes (B/LQ/H from rel, S from the unread shape-carrier
+    // input), and the query offset is S - LQ. Only the per-layer constants
+    // (dtype, band geometry) are template args, so exactly one pipeline is
+    // compiled per layer kind instead of one per (LQ, S) pair.
+    const int B  = rel_shape[0];
+    const int LQ = rel_shape[1];
+    const int H  = rel_shape[2];
+    const int S  = kshape_shape[2];
+    uint j  = thread_position_in_grid.x;   // key   position [0, S)
+    uint i  = thread_position_in_grid.y;   // query position [0, LQ)
+    uint bh = thread_position_in_grid.z;   // b * H + h
+    if ((int)i >= LQ || (int)j >= S || (int)bh >= B * H) return;
+    uint b = bh / H, h = bh % H;
+    int dist = ((int)i + (S - LQ)) - (int)j;     // backward distance
+    T val;
+    if (dist < 0) {
+        val = (T)(-1e30f);                                   // causal
+    } else if (SLIDING > 0 && dist >= (int)SLIDING) {
+        val = (T)(-1e30f);                                   // sliding-window cap
+    } else if (dist < (int)REL_EXTENT) {
+        float acc = 0.0f;
+        const size_t rbase = (size_t)b * rel_strides[0]
+            + (size_t)i * rel_strides[1] + (size_t)h * rel_strides[2];
+        for (uint d = 0; d < D_REL; ++d)
+            acc += (float)rel[rbase + (size_t)d * rel_strides[3]]
+                 * (float)proj[(size_t)d * proj_strides[0]
+                               + (size_t)dist * proj_strides[1]];
+        val = (T)acc;
+    } else {
+        val = (T)0;                                          // in-context, outside band
+    }
+    out[(((size_t)b * H + h) * LQ + i) * S + j] = val;
+"""
+_mask_v2_kernel = mx.fast.metal_kernel(
+    name="inkling_banded_mask_v2",
+    input_names=["rel", "proj", "kshape"],
+    output_names=["out"],
+    source=_MASK_V2_SRC,
+    ensure_row_contiguous=False,
+)
+
+
 def _rup(a, m):
     return ((a + m - 1) // m) * m
 
 
-def banded_additive_mask(rel, proj, q_offset, S, sliding, rel_extent):
+def banded_additive_mask(rel, proj, q_offset, S, sliding, rel_extent, shape_ref=None):
     """rel: [B, LQ, H, d_rel]; proj: [d_rel, rel_extent] -> additive mask [B, H, LQ, S]."""
     B, LQ, H, d_rel = rel.shape
     dtype = rel.dtype
@@ -118,6 +162,26 @@ def banded_additive_mask(rel, proj, q_offset, S, sliding, rel_extent):
     S = int(S)
     sliding = int(sliding)
     rel_extent = int(rel_extent)
+    if (
+        shape_ref is not None
+        and shape_ref.ndim >= 3
+        and shape_ref.shape[2] == S
+        and q_offset == S - LQ
+        and mx.default_device() == mx.gpu
+    ):
+        return _mask_v2_kernel(
+            inputs=[rel, proj, shape_ref],
+            template=[
+                ("T", dtype),
+                ("D_REL", d_rel),
+                ("REL_EXTENT", rel_extent),
+                ("SLIDING", sliding),
+            ],
+            grid=(_rup(S, 8), _rup(LQ, 8), B * H),
+            threadgroup=(8, 8, 1),
+            output_shapes=[(B, H, LQ, S)],
+            output_dtypes=[dtype],
+        )[0]
     if mx.default_device() == mx.gpu:
         return _mask_kernel(
             inputs=[rel, proj],
@@ -540,7 +604,13 @@ class InklingAttention(nn.Module):
         offset = S - L
 
         mask = banded_additive_mask(
-            r, self.rel_proj.astype(x.dtype), offset, S, self.sliding, self.rel_extent
+            r,
+            self.rel_proj.astype(x.dtype),
+            offset,
+            S,
+            self.sliding,
+            self.rel_extent,
+            shape_ref=k,
         )
         if self.log_floor is not None:
             qpos = (mx.arange(L) + offset + 1).astype(mx.float32)
