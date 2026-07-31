@@ -170,9 +170,16 @@ _SCONV_SRC = r"""
             acc += wk * v;
         }
         // Match the unfused path's rounding: the conv emits bf16 (rounded)
-        // before the fp32 residual add.
+        // before the fp32 residual add; the layer residual is a second bf16
+        // add on top (as the decoder layer's x + sconv(r) was).
         float conv_r = (float)((T)acc);
-        out[(b * L + i) * C + c] = (T)(conv_r + (float)x[(b * L + i) * C + c]);
+        T inner = (T)(conv_r + (float)x[(b * L + i) * C + c]);
+        if (HAS_RES) {
+            out[(b * L + i) * C + c] =
+                (T)((float)inner + (float)res[(b * L + i) * C + c]);
+        } else {
+            out[(b * L + i) * C + c] = inner;
+        }
     }
     for (uint s = 0; s < K - 1; ++s) {
         int r = (int)(L + s) - (int)(K - 1);
@@ -183,7 +190,7 @@ _SCONV_SRC = r"""
 """
 _sconv_kernel = mx.fast.metal_kernel(
     name="inkling_sconv_decode",
-    input_names=["x", "state", "w"],
+    input_names=["x", "state", "w", "res"],
     output_names=["out", "nstate"],
     source=_SCONV_SRC,
 )
@@ -202,7 +209,13 @@ class InklingShortConvolution(nn.Module):
             channels, channels, kernel_size, groups=channels, bias=False
         )
 
-    def __call__(self, x: mx.array, cache=None, mask: Optional[mx.array] = None):
+    def __call__(
+        self,
+        x: mx.array,
+        cache=None,
+        mask: Optional[mx.array] = None,
+        residual: Optional[mx.array] = None,
+    ):
         dt = x.dtype
         K = self.kernel_size
         if (
@@ -217,8 +230,20 @@ class InklingShortConvolution(nn.Module):
             if state is None:
                 state = mx.zeros((B, K - 1, C), dtype=mx.float32)
             out, nstate = _sconv_kernel(
-                inputs=[x, state, self.conv.weight.reshape(-1)],
-                template=[("T", dt), ("B", B), ("L", L), ("C", C), ("K", K)],
+                inputs=[
+                    x,
+                    state,
+                    self.conv.weight.reshape(-1),
+                    residual if residual is not None else x,
+                ],
+                template=[
+                    ("T", dt),
+                    ("B", B),
+                    ("L", L),
+                    ("C", C),
+                    ("K", K),
+                    ("HAS_RES", residual is not None),
+                ],
                 grid=(_rup(C, 32), B, 1),
                 threadgroup=(32, 1, 1),
                 output_shapes=[(B, L, C), (B, K - 1, C)],
@@ -239,7 +264,140 @@ class InklingShortConvolution(nn.Module):
         else:
             xp = mx.pad(xf, [(0, 0), (K - 1, 0), (0, 0)])
         out = self.conv(xp.astype(self.conv.weight.dtype)).astype(mx.float32)
-        return (out + res).astype(dt)
+        out = (out + res).astype(dt)
+        return out if residual is None else residual + out
+
+
+_ATTN_SRC = r"""
+    // Flash-style decode attention for L=1: one threadgroup of 128 threads
+    // (4 simdgroups) per (batch, q-head); simdgroups split the key range and
+    // merge online-softmax partials at the end. Replaces q_norm + banded-mask
+    // materialization + masked SDPA + log-tau scaling + the transposes around
+    // them. K/V are read from the cache views via injected strides (S comes
+    // from k_shape, so no per-step kernel respecialization); the raw fused
+    // projection row is read via column offsets. Sliding layers scan only
+    // their window. bf16 rounding points of the unfused path (normed q, tau
+    // products, band value) are reproduced.
+    uint lane = thread_index_in_simdgroup;        // 0..31
+    uint sg   = simdgroup_index_in_threadgroup;   // 0..3
+    uint tid  = sg * 32 + lane;                   // 0..127
+    uint h    = threadgroup_position_in_grid.y;   // q head
+    uint b    = threadgroup_position_in_grid.z;   // batch row
+    float eps    = params[0];
+    float alpha  = params[1];
+    float nfloor = params[2];
+    const int S = k_shape[2];
+    const uint hkv = h / (HQ / HKV);
+    const size_t qrow = (size_t)b * qkvr_strides[0]
+        + (size_t)(qkvr_shape[1] - 1) * qkvr_strides[1];
+    const size_t qc = qkvr_strides[2];
+    const device T* qp = qkvr + qrow + (size_t)h * D * qc;          // q columns
+    const device T* rp = qkvr + qrow + ((size_t)R_OFF + (size_t)h * DR) * qc;
+    float tau = 1.0f;
+    if (HAS_TAU) {
+        tau = 1.0f + alpha * metal::log(metal::max((float)S / nfloor, 1.0f));
+        tau = (float)((T)tau);
+    }
+    // Cooperative q RMSNorm in fp32 (one dim per thread); round to bf16 like
+    // the unfused path, then the tau product rounds again.
+    threadgroup float qs[D];
+    threadgroup float red[4];
+    threadgroup float tgm[4], tgl[4];
+    threadgroup float tgacc[4][D];
+    float x0 = (float)qp[tid * qc];
+    float ps_ = simd_sum(x0 * x0);
+    if (lane == 0) red[sg] = ps_;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float ss = red[0] + red[1] + red[2] + red[3];
+    float inv = metal::rsqrt(ss / (float)D + eps);
+    float qn = (float)((T)(x0 * inv * (float)qw[tid]));
+    if (HAS_TAU) qn = (float)((T)(qn * tau));
+    qs[tid] = qn;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float scale = 1.0f / (float)D;
+    const int jstart = (SLIDING > 0 && S > SLIDING) ? S - SLIDING : 0;
+    const int j0base = (jstart / 32) * 32;
+    float m = -INFINITY, l = 0.0f;
+    float4 acc = float4(0.0f);
+    for (int j0 = j0base + (int)sg * 32; j0 < S; j0 += 128) {
+        int j = j0 + (int)lane;
+        float score = -INFINITY;
+        if (j >= jstart && j < S) {
+            const size_t krow = (size_t)b * k_strides[0]
+                + (size_t)hkv * k_strides[1] + (size_t)j * k_strides[2];
+            // packed 4-wide loads: cache buffers are only element-aligned,
+            // so vec<T,4> (8-byte alignment) must not be used here.
+            const device packed_ushort4* kp4 =
+                (const device packed_ushort4*)(k + krow);
+            float dot = 0.0f;
+            for (uint t = 0; t < D / 4; ++t) {
+                packed_ushort4 kr = kp4[t];
+                float4 kv = float4((float)as_type<T>(kr.x), (float)as_type<T>(kr.y),
+                                   (float)as_type<T>(kr.z), (float)as_type<T>(kr.w));
+                dot += qs[t * 4 + 0] * kv.x + qs[t * 4 + 1] * kv.y
+                     + qs[t * 4 + 2] * kv.z + qs[t * 4 + 3] * kv.w;
+            }
+            int dist = (S - 1) - j;
+            float band = 0.0f;
+            if (dist < REL_EXTENT) {
+                float accb = 0.0f;
+                for (uint d = 0; d < DR; ++d)
+                    accb += (float)rp[d * qc] * (float)rproj[d * REL_EXTENT + dist];
+                band = (float)((T)accb);
+                if (HAS_TAU) band = (float)((T)(band * tau));
+            }
+            score = dot * scale + band;
+        }
+        float cm = simd_max(score);
+        if (cm == -INFINITY) continue;
+        float nm = metal::max(m, cm);
+        float corr = (m > -INFINITY) ? metal::exp(m - nm) : 0.0f;
+        float p = (score > -INFINITY) ? metal::exp(score - nm) : 0.0f;
+        l = l * corr + simd_sum(p);
+        acc *= corr;
+        for (uint u = 0; u < 32; ++u) {
+            float pu = simd_shuffle(p, (ushort)u);
+            if (pu > 0.0f) {
+                int ju = j0 + (int)u;
+                const size_t vrow = (size_t)b * v_strides[0]
+                    + (size_t)hkv * v_strides[1] + (size_t)ju * v_strides[2];
+                const device packed_ushort4* vp4 =
+                    (const device packed_ushort4*)(v + vrow);
+                packed_ushort4 vr = vp4[lane];
+                acc += pu * float4((float)as_type<T>(vr.x), (float)as_type<T>(vr.y),
+                                   (float)as_type<T>(vr.z), (float)as_type<T>(vr.w));
+            }
+        }
+        m = nm;
+    }
+    // Merge the four simdgroup partials (each lane owns dims lane*4..+3).
+    if (lane == 0) { tgm[sg] = m; tgl[sg] = l; }
+    tgacc[sg][lane * 4 + 0] = acc.x;
+    tgacc[sg][lane * 4 + 1] = acc.y;
+    tgacc[sg][lane * 4 + 2] = acc.z;
+    tgacc[sg][lane * 4 + 3] = acc.w;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float M = metal::max(metal::max(tgm[0], tgm[1]), metal::max(tgm[2], tgm[3]));
+    float w0 = (tgm[0] > -INFINITY) ? metal::exp(tgm[0] - M) : 0.0f;
+    float w1 = (tgm[1] > -INFINITY) ? metal::exp(tgm[1] - M) : 0.0f;
+    float w2 = (tgm[2] > -INFINITY) ? metal::exp(tgm[2] - M) : 0.0f;
+    float w3 = (tgm[3] > -INFINITY) ? metal::exp(tgm[3] - M) : 0.0f;
+    float Lt = tgl[0] * w0 + tgl[1] * w1 + tgl[2] * w2 + tgl[3] * w3;
+    float od = tgacc[0][tid] * w0 + tgacc[1][tid] * w1
+             + tgacc[2][tid] * w2 + tgacc[3][tid] * w3;
+    device T* op = out + ((size_t)b * HQ + h) * D;
+    op[tid] = (T)(od / Lt);
+"""
+_attn_kernel = mx.fast.metal_kernel(
+    name="inkling_attn_decode",
+    input_names=["qkvr", "k", "v", "qw", "rproj", "params"],
+    output_names=["out"],
+    source=_ATTN_SRC,
+    ensure_row_contiguous=False,
+)
+
+# Escape hatch: force the unfused decode-attention path (debugging/AB tests).
+_FUSED_ATTN_DECODE = True
 
 
 class InklingAttention(nn.Module):
@@ -266,21 +424,21 @@ class InklingAttention(nn.Module):
         self.log_floor = None if self.is_sliding else config.log_scaling_n_floor
         self.log_alpha = config.log_scaling_alpha
 
-        self.q_proj = nn.Linear(
-            config.hidden_size, self.n_heads * self.head_dim, bias=False
+        # q/k/v/r share the input row; their weights are stacked at load
+        # (see fuse_qkvr) so decode does one matmul instead of four.
+        self.qkvr_dims = (
+            self.n_heads * self.head_dim,
+            self.n_kv * self.head_dim,
+            self.n_kv * self.head_dim,
+            self.n_heads * self.d_rel,
         )
-        self.k_proj = nn.Linear(
-            config.hidden_size, self.n_kv * self.head_dim, bias=False
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size, self.n_kv * self.head_dim, bias=False
-        )
-        self.r_proj = nn.Linear(
-            config.hidden_size, self.n_heads * self.d_rel, bias=False
+        self.qkvr_proj = nn.Linear(
+            config.hidden_size, sum(self.qkvr_dims), bias=False
         )
         self.o_proj = nn.Linear(
             self.n_heads * self.head_dim, config.hidden_size, bias=False
         )
+        self._attn_params = None
         self.k_sconv = InklingShortConvolution(
             self.n_kv * self.head_dim, config.sconv_kernel_size, conv_idx=0
         )
@@ -296,20 +454,75 @@ class InklingAttention(nn.Module):
         kv = cache[0] if cache is not None else None
         conv = cache[1] if cache is not None else None
 
-        q = self.q_proj(x)
-        k = self.k_sconv(self.k_proj(x), cache=conv, mask=conv_mask)
-        v = self.v_sconv(self.v_proj(x), cache=conv, mask=conv_mask)
-        r = self.r_proj(x).reshape(B, L, self.n_heads, self.d_rel)
-
-        q = self.q_norm(q.reshape(B, L, self.n_heads, self.head_dim)).transpose(
-            0, 2, 1, 3
+        qkvr = self.qkvr_proj(x)
+        dq, dk, dv, _ = self.qkvr_dims
+        k = self.k_sconv(qkvr[..., dq : dq + dk], cache=conv, mask=conv_mask)
+        v = self.v_sconv(
+            qkvr[..., dq + dk : dq + dk + dv], cache=conv, mask=conv_mask
         )
+
         k = self.k_norm(k.reshape(B, L, self.n_kv, self.head_dim)).transpose(0, 2, 1, 3)
         v = v.reshape(B, L, self.n_kv, self.head_dim).transpose(0, 2, 1, 3)
 
         if kv is not None:
             k, v = kv.update_and_fetch(k, v)
         S = k.shape[2]
+
+        if (
+            L == 1
+            and _FUSED_ATTN_DECODE
+            and mx.default_device() == mx.gpu
+            # the kernel reads k/v/qkvr as one dtype; a promoted-fp32 cache
+            # (e.g. fp32 norm weights) must take the unfused path
+            and k.dtype == x.dtype
+            and v.dtype == x.dtype
+        ):
+            if self._attn_params is None:
+                self._attn_params = mx.array(
+                    [
+                        self.q_norm.eps,
+                        self.log_alpha,
+                        float(self.log_floor) if self.log_floor is not None else 1.0,
+                    ],
+                    dtype=mx.float32,
+                )
+                self._rel_proj_cast = (
+                    self.rel_proj
+                    if self.rel_proj.dtype == x.dtype
+                    else self.rel_proj.astype(x.dtype)
+                )
+            out = _attn_kernel(
+                inputs=[
+                    qkvr,
+                    k,
+                    v,
+                    self.q_norm.weight,
+                    self._rel_proj_cast,
+                    self._attn_params,
+                ],
+                template=[
+                    ("T", x.dtype),
+                    ("HQ", self.n_heads),
+                    ("HKV", self.n_kv),
+                    ("D", self.head_dim),
+                    ("DR", self.d_rel),
+                    ("R_OFF", dq + dk + dv),
+                    ("REL_EXTENT", self.rel_extent),
+                    ("SLIDING", self.sliding),
+                    ("HAS_TAU", self.log_floor is not None),
+                ],
+                grid=(128, self.n_heads, B),
+                threadgroup=(128, 1, 1),
+                output_shapes=[(B, 1, self.n_heads * self.head_dim)],
+                output_dtypes=[x.dtype],
+            )[0]
+            return self.o_proj(out)
+
+        q = qkvr[..., :dq]
+        r = qkvr[..., dq + dk + dv :].reshape(B, L, self.n_heads, self.d_rel)
+        q = self.q_norm(q.reshape(B, L, self.n_heads, self.head_dim)).transpose(
+            0, 2, 1, 3
+        )
         # Query positions derive from the post-update key length: the queries
         # are always the last L of the S cached positions. Do NOT trust
         # kv.offset here — batch cache implementations (e.g. an engine's
@@ -474,6 +687,26 @@ class InklingSharedExpertsDense(nn.Module):
         return self.down_proj(_swiglu_scaled(self.gate_proj(x), self.up_proj(x), gamma))
 
 
+def fuse_qkvr(weights):
+    """Stack per-layer q/k/v/r projection tensors (rows, plus scales/biases for
+    quantized checkpoints) into the single ``qkvr_proj``. Row-concat of
+    quantized matrices is exact: each output row keeps its own groups."""
+    out = dict(weights)
+    prefixes = {
+        k[: -len("q_proj.weight")]
+        for k in weights
+        if k.endswith(".self_attn.q_proj.weight")
+    }
+    for p in prefixes:
+        for leaf in ("weight", "scales", "biases"):
+            parts = [out.pop(f"{p}{n}_proj.{leaf}", None) for n in "qkvr"]
+            if all(v is not None for v in parts):
+                out[f"{p}qkvr_proj.{leaf}"] = mx.concatenate(parts, axis=0)
+            elif any(v is not None for v in parts):
+                raise ValueError(f"partial q/k/v/r {leaf} set under {p}")
+    return out
+
+
 def shared_experts_to_dense(weights):
     """Remap SwitchGLU-shaped shared-expert tensors ``[E, out, in]`` (bf16 or
     quantized triplets) to the dense concatenated layout of
@@ -600,9 +833,9 @@ class InklingDecoderLayer(nn.Module):
     def __call__(self, x, cache=None, conv_mask=None):
         conv = cache[1] if cache is not None else None
         r = self.self_attn(self.input_layernorm(x), cache=cache, conv_mask=conv_mask)
-        h = x + self.attn_sconv(r, cache=conv, mask=conv_mask)
+        h = self.attn_sconv(r, cache=conv, mask=conv_mask, residual=x)
         r = self.mlp(self.post_attention_layernorm(h))
-        return h + self.mlp_sconv(r, cache=conv, mask=conv_mask)
+        return self.mlp_sconv(r, cache=conv, mask=conv_mask, residual=h)
 
 
 class InklingModel(nn.Module):
