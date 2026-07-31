@@ -466,6 +466,8 @@ _FUSED_ATTN_DECODE = True
 # larger kernels beat the custom kernel at tiny S); above it the fused kernel
 # wins outright and by 4k context is ~2.6x faster end-to-end.
 _FUSED_ATTN_MIN_S = 512
+# Escape hatch: skip the sliding-layer out-of-window K/V slicing.
+_SLIDING_KV_SLICE = True
 
 
 class InklingAttention(nn.Module):
@@ -595,6 +597,14 @@ class InklingAttention(nn.Module):
         q = self.q_norm(q.reshape(B, L, self.n_heads, self.head_dim)).transpose(
             0, 2, 1, 3
         )
+        if _SLIDING_KV_SLICE and self.sliding > 0 and S > L + self.sliding - 1:
+            # No query row can reach keys older than its window; slice them
+            # off before the mask and SDPA (they were -1e30 masked anyway).
+            # The mask keeps the right positions: its offset is S_eff - L.
+            j0 = S - L - (self.sliding - 1)
+            k = k[:, :, j0:, :]
+            v = v[:, :, j0:, :]
+            S = k.shape[2]
         # Query positions derive from the post-update key length: the queries
         # are always the last L of the S cached positions. Do NOT trust
         # kv.offset here — batch cache implementations (e.g. an engine's
